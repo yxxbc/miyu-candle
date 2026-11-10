@@ -1,0 +1,5 @@
+[package]
+author = "yxxbc"
+upstream = "https://github.com/yxxbc/miyu-candle"
+name = { en = "Market charts", zh = "K 线行情", ja = "マーケットチャート" }
+summary = { en = "Binance candles, indicators and chart images", zh = "Binance K 线、指标和出图", ja = "Binance のローソク足・指標・チャート画像" }
