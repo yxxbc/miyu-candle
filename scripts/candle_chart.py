@@ -1,25 +1,30 @@
 #!/usr/bin/env python3
-# Description: Draw a candlestick chart from Binance candles (spot or USDT-M perpetual) into a PNG and return its path: price with MA/EMA/BOLL/VWAP overlays, panes for volume, RSI, MACD, KDJ, ATR, OBV. Needs matplotlib (ships with the macOS command line tools).
+# Description: Draw a candlestick chart from Binance candles or Eastmoney A-share, index and HK candles into a PNG and return its path: price with MA/EMA/BOLL/VWAP overlays, panes for volume, RSI, MACD, KDJ, ATR, OBV. Needs matplotlib (ships with the macOS command line tools).
 # Display name: Market chart
 # 显示名称：K 线图
-# 描述：把 Binance K 线画成 PNG（K 线 + 均线/BOLL/VWAP，副图可放成交量、RSI、MACD、KDJ、ATR、OBV），返回图片路径。要 matplotlib。
+# 描述：把 K 线画成 PNG（K 线 + 均线/BOLL/VWAP，副图可放成交量、RSI、MACD、KDJ、ATR、OBV），币和 A 股、指数、港股都能画，返回图片路径。要 matplotlib。
 # Timeout: 60
 # Parameters:
 # {"type": "object", "properties": {
-#   "symbol": {"type": "string", "description": "Ticker such as BTCUSDT; btc becomes BTCUSDT; BTCUSDT.P means USDT-M perpetual"},
-#   "interval": {"type": "string", "enum": ["1m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d", "3d", "1w", "1M"], "description": "Default 1h"},
-#   "market": {"type": "string", "enum": ["spot", "perp"], "description": "Default spot"},
+#   "symbol": {"type": "string", "description": "BTCUSDT, btc, BTCUSDT.P; or 600519, 茅台, 00700, 上证指数"},
+#   "interval": {"type": "string", "enum": ["1m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d", "3d", "1w", "1M"], "description": "Default 1h. Stocks support 1m/5m/15m/30m/1h/2h/4h/1d/3d/1w/1M"},
+#   "market": {"type": "string", "enum": ["spot", "perp"], "description": "Binance only, default spot"},
 #   "limit": {"type": "integer", "description": "Candles to draw, 30-500, default 150"},
 #   "studies": {"type": "array", "items": {"type": "string"}, "description": "Mix of overlays (ma20, ema50, wma20, boll, vwap) and panes (vol, rsi, macd, kdj, atr, obv). Default [ma20, ma60, vol, macd]"},
 #   "theme": {"type": "string", "enum": ["dark", "light"], "description": "Default dark"},
 #   "path": {"type": "string", "description": "Where to save the PNG; default a charts folder inside the Miyu cache"}
 # }, "required": ["symbol"]}
-import datetime, json, os, re, sys, tempfile, time, urllib.error, urllib.parse, urllib.request
+import datetime
+import json
+import os
+import re
+import sys
+import time
 
-SPOT = "https://data-api.binance.vision"
-FAPI = "https://fapi.binance.com"
-QUOTES = ("USDT", "USDC", "FDUSD", "TUSD", "BUSD", "BTC", "ETH", "BNB", "EUR", "USD", "TRY", "BRL", "JPY")
-INTERVALS = ("1m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "12h", "1d", "3d", "1w", "1M")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "lib"))
+from marketdata import (Fail, args, atr, boll, ema, fetch, interval_of, kdj, macd,  # noqa: E402
+                        obv, resolve, rsi, sma, vwap_daily, wma, work_dir)
+
 OVERLAYS = ("ma", "ema", "wma", "boll", "vwap")
 PANES = ("vol", "rsi", "macd", "kdj", "atr", "obv")
 THEMES = {
@@ -28,228 +33,6 @@ THEMES = {
     "light": {"bg": "#ffffff", "grid": "#e8eaed", "text": "#2a2e39", "muted": "#787b86", "up": "#089981", "down": "#f23645",
               "lines": ["#2962ff", "#f0b90b", "#ab47bc", "#ff7043", "#00897b"]},
 }
-
-
-class Fail(Exception):
-    pass
-
-
-def args():
-    raw = os.environ.get("MIYU_ARGS_JSON")
-    if raw is None:
-        raw = "" if sys.stdin.isatty() else sys.stdin.read()
-    return json.loads(raw) if raw and raw.strip() else {}
-
-
-def work_dir():
-    for key in ("MIYU_CACHE_DIR", "MIYU_STATE_DIR", "MIYU_WORKSPACE_DIR"):
-        value = os.environ.get(key)
-        if value:
-            return value
-    return os.path.join(tempfile.gettempdir(), "miyu-candle")
-
-
-def http(path, params):
-    url = path + "?" + urllib.parse.urlencode(params)
-    req = urllib.request.Request(url, headers={"User-Agent": "miyu-candle/1.0"})
-    try:
-        with urllib.request.urlopen(req, timeout=20) as r:
-            return json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        body = e.read().decode("utf-8", "replace")
-        try:
-            msg = json.loads(body).get("msg") or body
-        except Exception:
-            msg = body
-        raise Fail("Binance: %s (HTTP %d)" % (msg, e.code))
-    except urllib.error.URLError as e:
-        raise Fail("network: %s (Binance needs the system proxy in mainland China)" % (e.reason,))
-
-
-def resolve(symbol, market):
-    s = "".join((symbol or "").split()).upper().replace("/", "").replace("-", "").replace("_", "")
-    if not s:
-        raise Fail("symbol is empty")
-    if s.endswith(".P"):
-        s, market = s[:-2], "perp"
-    if not any(s.endswith(q) and len(s) > len(q) for q in QUOTES):
-        s += "USDT"
-    return s, (market or "spot")
-
-
-def interval_of(value):
-    v = (value or "1h").strip()
-    if v == "1M":
-        return v
-    low = v.lower()
-    if low in INTERVALS:
-        return low
-    raise Fail("interval %r is not one of %s" % (value, ", ".join(INTERVALS)))
-
-
-def candles(symbol, interval, limit, market):
-    if market == "perp":
-        rows = http(FAPI + "/fapi/v1/klines", {"symbol": symbol, "interval": interval, "limit": limit})
-    else:
-        rows = http(SPOT + "/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit})
-    return [[int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5])] for r in rows]
-
-
-# --- indicator math (same definitions as candle_indicator) ---
-
-def sma(vals, n):
-    out = [None] * len(vals)
-    total = 0.0
-    for i, v in enumerate(vals):
-        total += v
-        if i >= n:
-            total -= vals[i - n]
-        if i >= n - 1:
-            out[i] = total / n
-    return out
-
-
-def ema(vals, n):
-    out = [None] * len(vals)
-    k = 2.0 / (n + 1)
-    prev = None
-    seen = 0
-    for i, v in enumerate(vals):
-        if v is None:
-            continue
-        seen += 1
-        if seen < n:
-            continue
-        if seen == n:
-            prev = sum(x for x in vals[: i + 1] if x is not None) / n
-        else:
-            prev = v * k + prev * (1 - k)
-        out[i] = prev
-    return out
-
-
-def rma(vals, n):
-    out = [None] * len(vals)
-    prev = None
-    seen = 0
-    for i, v in enumerate(vals):
-        if v is None:
-            continue
-        seen += 1
-        if seen < n:
-            continue
-        if seen == n:
-            prev = sum(x for x in vals[: i + 1] if x is not None) / n
-        else:
-            prev = (prev * (n - 1) + v) / n
-        out[i] = prev
-    return out
-
-
-def wma(vals, n):
-    out = [None] * len(vals)
-    weight = n * (n + 1) / 2
-    for i in range(n - 1, len(vals)):
-        if any(v is None for v in vals[i - n + 1: i + 1]):
-            continue
-        out[i] = sum(vals[i - n + 1 + j] * (j + 1) for j in range(n)) / weight
-    return out
-
-
-def rsi(vals, n):
-    gains = [None] * len(vals)
-    losses = [None] * len(vals)
-    for i in range(1, len(vals)):
-        diff = vals[i] - vals[i - 1]
-        gains[i] = diff if diff > 0 else 0.0
-        losses[i] = -diff if diff < 0 else 0.0
-    up = rma(gains, n)
-    down = rma(losses, n)
-    out = [None] * len(vals)
-    for i in range(len(vals)):
-        if up[i] is None or down[i] is None:
-            continue
-        out[i] = 100.0 if down[i] == 0 else 100.0 - 100.0 / (1.0 + up[i] / down[i])
-    return out
-
-
-def boll(vals, n, mult):
-    mid = sma(vals, n)
-    upper = [None] * len(vals)
-    lower = [None] * len(vals)
-    for i in range(n - 1, len(vals)):
-        window = vals[i - n + 1: i + 1]
-        mean = mid[i]
-        sd = (sum((v - mean) ** 2 for v in window) / n) ** 0.5
-        upper[i] = mean + mult * sd
-        lower[i] = mean - mult * sd
-    return upper, mid, lower
-
-
-def macd(vals, fast, slow, signal):
-    fast_line = ema(vals, fast)
-    slow_line = ema(vals, slow)
-    dif = [None if fast_line[i] is None or slow_line[i] is None else fast_line[i] - slow_line[i] for i in range(len(vals))]
-    dea = ema(dif, signal)
-    hist = [None if dif[i] is None or dea[i] is None else dif[i] - dea[i] for i in range(len(vals))]
-    return dif, dea, hist
-
-
-def atr(data, n):
-    tr = [None] * len(data)
-    for i, d in enumerate(data):
-        if i == 0:
-            tr[i] = d[2] - d[3]
-        else:
-            prev_close = data[i - 1][4]
-            tr[i] = max(d[2] - d[3], abs(d[2] - prev_close), abs(d[3] - prev_close))
-    return rma(tr, n)
-
-
-def kdj(data, n, k_n, d_n):
-    k_line = [None] * len(data)
-    d_line = [None] * len(data)
-    j_line = [None] * len(data)
-    k_prev = 0.0
-    d_prev = 0.0
-    for i in range(len(data)):
-        if i < n - 1:
-            continue
-        window = data[i - n + 1: i + 1]
-        hh = max(w[2] for w in window)
-        ll = min(w[3] for w in window)
-        rsv = 50.0 if hh == ll else (data[i][4] - ll) / (hh - ll) * 100.0
-        k_prev = (k_prev * (k_n - 1) + rsv) / k_n
-        d_prev = (d_prev * (d_n - 1) + k_prev) / d_n
-        k_line[i] = k_prev
-        d_line[i] = d_prev
-        j_line[i] = 3 * k_prev - 2 * d_prev
-    return k_line, d_line, j_line
-
-
-def obv(data):
-    out = [0.0] * len(data)
-    for i in range(1, len(data)):
-        prev_close, close, volume = data[i - 1][4], data[i][4], data[i][5]
-        step = volume if close > prev_close else (-volume if close < prev_close else 0.0)
-        out[i] = out[i - 1] + step
-    return out
-
-
-def vwap_daily(data):
-    out = [None] * len(data)
-    day = None
-    pv = 0.0
-    vol = 0.0
-    for i, d in enumerate(data):
-        stamp = datetime.datetime.fromtimestamp(d[0] / 1000.0, datetime.timezone.utc).date()
-        if stamp != day:
-            day, pv, vol = stamp, 0.0, 0.0
-        typical = (d[2] + d[3] + d[4]) / 3.0
-        pv += typical * d[5]
-        vol += d[5]
-        out[i] = pv / vol if vol else None
-    return out
 
 
 def num(value):
@@ -267,6 +50,8 @@ def num(value):
 def compact(value):
     if value is None:
         return ""
+    if abs(value) < 1:
+        return "0"
     for scale, suffix in ((1e9, "B"), (1e6, "M"), (1e3, "k")):
         if abs(value) >= scale:
             text = "%.2f" % (value / scale)
@@ -297,7 +82,7 @@ def parse_studies(raw):
     return overlays, panes
 
 
-def draw(data, symbol, interval, market, overlays, panes, theme_name, out_path):
+def draw(data, res, interval, overlays, panes, theme_name, out_path):
     os.environ.setdefault("MPLCONFIGDIR", os.path.join(work_dir(), "mpl"))
     import matplotlib
     matplotlib.use("Agg")
@@ -305,8 +90,13 @@ def draw(data, symbol, interval, market, overlays, panes, theme_name, out_path):
     from matplotlib.patches import Rectangle
     import numpy as np
 
+    plt.rcParams["font.sans-serif"] = ["PingFang SC", "Hiragino Sans GB", "Heiti SC", "DejaVu Sans"]
+    plt.rcParams["font.family"] = "sans-serif"
+    plt.rcParams["axes.unicode_minus"] = False
+
     theme = THEMES[theme_name]
     bg, grid, text, muted = theme["bg"], theme["grid"], theme["text"], theme["muted"]
+    session_tz = datetime.timezone.utc if res["source"] == "binance" else None
 
     n = len(data)
     x = np.arange(n)
@@ -353,9 +143,9 @@ def draw(data, symbol, interval, market, overlays, panes, theme_name, out_path):
                     high_limit = max(high_limit, max(vals))
             continue
         if name == "vwap":
-            series, label = vwap_daily(data), "VWAP"
+            series, label = vwap_daily(data, session_tz), "VWAP"
         else:
-            length = period or {"ma": 20, "ema": 20, "wma": 20}[name]
+            length = period or 20
             series = {"ma": sma, "ema": ema, "wma": wma}[name](closes.tolist(), length)
             label = "%s %d" % (name.upper(), length)
         ax.plot(x, series, color=color, lw=1.1, label=label)
@@ -371,7 +161,8 @@ def draw(data, symbol, interval, market, overlays, panes, theme_name, out_path):
     ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: num(v)))
     ax.legend(loc="upper left", frameon=False, fontsize=7.5, labelcolor=text, ncols=6,
               handlelength=1.3, columnspacing=1.1, borderpad=0)
-    ax.text(0.5, 0.45, symbol.replace("USDT", ""), transform=ax.transAxes, fontsize=64,
+    watermark = (res.get("name") or res["symbol"]).replace("USDT", "")
+    ax.text(0.5, 0.45, watermark, transform=ax.transAxes, fontsize=56 if not res.get("name") else 44,
             color=text, alpha=0.045, ha="center", va="center")
 
     for slot, (name, period) in enumerate(panes):
@@ -382,11 +173,10 @@ def draw(data, symbol, interval, market, overlays, panes, theme_name, out_path):
         if name == "vol":
             pane.bar(x, vols, width=0.62, color=candle_colors, alpha=0.55, linewidth=0)
             pane.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: compact(v)))
-            title = "Volume"
+            title = {"base": "Volume", "lot": "Volume (lots)", "share": "Volume (shares)"}[res["volume_unit"]]
         elif name == "rsi":
             length = period or 14
-            series = rsi(closes.tolist(), length)
-            pane.plot(x, series, color=theme["lines"][1], lw=1.1)
+            pane.plot(x, rsi(closes.tolist(), length), color=theme["lines"][1], lw=1.1)
             pane.axhline(70, color=muted, lw=0.8, ls="--")
             pane.axhline(30, color=muted, lw=0.8, ls="--")
             pane.set_ylim(0, 100)
@@ -418,7 +208,8 @@ def draw(data, symbol, interval, market, overlays, panes, theme_name, out_path):
             pane.plot(x, obv(data), color=theme["lines"][4], lw=1.1)
             pane.yaxis.set_major_formatter(plt.FuncFormatter(lambda v, _: compact(v)))
             title = "OBV"
-        pane.text(0.003, 0.86, title, transform=pane.transAxes, fontsize=7.5, color=muted)
+        pane.text(0.004, 0.985, title, transform=pane.transAxes, fontsize=7.5, color=muted, va="top",
+                  bbox=dict(facecolor=bg, edgecolor="none", pad=1.5, alpha=0.85))
 
     for pane in axes:
         pane.set_facecolor(bg)
@@ -438,7 +229,8 @@ def draw(data, symbol, interval, market, overlays, panes, theme_name, out_path):
     axes[-1].set_xticklabels([time.strftime(fmt, time.localtime(data[i][0] / 1000)) for i in ticks])
 
     window_change = (closes[-1] - opens[0]) / opens[0] * 100 if opens[0] else 0.0
-    fig.text(0.05, 0.955, "%s · %s · %s" % (symbol, interval, market), fontsize=13.5, color=text, weight="semibold")
+    heading = " · ".join(part for part in (res.get("name"), res["symbol"], interval, res["market"]) if part)
+    fig.text(0.05, 0.955, heading, fontsize=13.5, color=text, weight="semibold")
     fig.text(0.05, 0.925,
              "close %s   window %+.2f%%   high %s   low %s   %d bars" % (
                  num(closes[-1]), window_change, num(highs.max()), num(lows.min()), n),
@@ -454,39 +246,45 @@ def draw(data, symbol, interval, market, overlays, panes, theme_name, out_path):
 
 def main():
     a = args()
-    symbol, market = resolve(a.get("symbol"), a.get("market"))
-    if market not in ("spot", "perp"):
-        raise Fail("market must be spot or perp")
-    interval = interval_of(a.get("interval"))
+    res = resolve(a.get("symbol"), a.get("market"))
+    interval = interval_of(a.get("interval"), res["source"])
     limit = max(30, min(500, int(a.get("limit") or 150)))
     theme_name = (a.get("theme") or "dark").strip().lower()
     if theme_name not in THEMES:
         raise Fail("theme must be dark or light")
     overlays, panes = parse_studies(a.get("studies"))
 
-    data = candles(symbol, interval, limit, market)
+    data = fetch(res, interval, limit)
     if len(data) < 30:
-        raise Fail("Binance returned only %d candles" % len(data))
+        raise Fail("only %d candles came back, not enough to draw" % len(data))
 
     out_path = a.get("path")
     if out_path:
         out_path = os.path.expanduser(out_path)
     else:
-        folder = os.path.join(work_dir(), "charts")
-        out_path = os.path.join(folder, "%s-%s-%s-%s.png" % (
-            symbol, interval, market, time.strftime("%Y%m%d-%H%M%S")))
+        out_path = os.path.join(work_dir(), "charts", "%s-%s-%s-%s.png" % (
+            res["symbol"], interval, res["market"], time.strftime("%Y%m%d-%H%M%S")))
 
-    draw(data, symbol, interval, market, overlays, panes, theme_name, out_path)
+    draw(data, res, interval, overlays, panes, theme_name, out_path)
 
-    print(json.dumps({
+    out = {
         "path": os.path.abspath(out_path),
-        "symbol": symbol,
-        "market": market,
+        "symbol": res["symbol"],
+        "market": res["market"],
+        "source": res["source"],
         "interval": interval,
         "bars": len(data),
         "studies": ["%s%s" % (name, period or "") for name, period in overlays + panes],
         "last_close": data[-1][4],
-    }, ensure_ascii=False))
+    }
+    if res.get("name"):
+        out["name"] = res["name"]
+    if len(data) < limit:
+        note = "drawn %d of the %d asked" % (len(data), limit)
+        if res["source"] == "eastmoney" and interval not in ("1d", "3d", "1w", "1M"):
+            note += "; Eastmoney keeps roughly the last six weeks of minute and hour candles"
+        out["note"] = note
+    print(json.dumps(out, ensure_ascii=False))
 
 
 if __name__ == "__main__":
